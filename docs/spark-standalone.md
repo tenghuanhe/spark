@@ -242,12 +242,21 @@ SPARK_WORKER_OPTS supports the following system properties:
 </tr>
 <tr>
   <td><code>spark.worker.cleanup.appDataTtl</code></td>
-  <td>7 * 24 * 3600 (7 days)</td>
+  <td>604800 (7 days, 7 * 24 * 3600)</td>
   <td>
     The number of seconds to retain application work directories on each worker.  This is a Time To Live
     and should depend on the amount of available disk space you have.  Application logs and jars are
     downloaded to each application work dir.  Over time, the work dirs can quickly fill up disk space,
     especially if you run jobs very frequently.
+  </td>
+</tr>
+<tr>
+  <td><code>spark.worker.ui.compressedLogFileLengthCacheSize</code></td>
+  <td>100</td>
+  <td>
+    For compressed log files, the uncompressed file can only be computed by uncompressing the files.
+    Spark caches the uncompressed file size of compressed log files. This property controls the cache
+    size.
   </td>
 </tr>
 </table>

@@ -24,8 +24,8 @@ import scala.collection.mutable.ArrayBuffer
 import org.apache.commons.lang3.StringEscapeUtils
 import org.apache.log4j.{Level, LogManager}
 import org.apache.spark.{SparkContext, SparkFunSuite}
-import org.apache.spark.internal.config._
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.internal.StaticSQLConf.CATALOG_IMPLEMENTATION
 import org.apache.spark.util.Utils
 
 class ReplSuite extends SparkFunSuite {
@@ -45,7 +45,7 @@ class ReplSuite extends SparkFunSuite {
         }
       }
     }
-    val classpath = paths.mkString(File.pathSeparator)
+    val classpath = paths.map(new File(_).getAbsolutePath).mkString(File.pathSeparator)
 
     val oldExecutorClasspath = System.getProperty(CONF_EXECUTOR_CLASSPATH)
     System.setProperty(CONF_EXECUTOR_CLASSPATH, classpath)
@@ -471,6 +471,17 @@ class ReplSuite extends SparkFunSuite {
         |  s"deviation too large: $deviation, first size: $cacheSize1, second size: $cacheSize2")
       """.stripMargin)
     assertDoesNotContain("AssertionError", output)
+    assertDoesNotContain("Exception", output)
+  }
+
+  test("newProductSeqEncoder with REPL defined class") {
+    val output = runInterpreterInPasteMode("local-cluster[1,4,4096]",
+      """
+      |case class Click(id: Int)
+      |spark.implicits.newProductSeqEncoder[Click]
+    """.stripMargin)
+
+    assertDoesNotContain("error:", output)
     assertDoesNotContain("Exception", output)
   }
 }

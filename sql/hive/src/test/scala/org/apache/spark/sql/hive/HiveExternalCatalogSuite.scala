@@ -20,7 +20,10 @@ package org.apache.spark.sql.hive
 import org.apache.hadoop.conf.Configuration
 
 import org.apache.spark.SparkConf
+import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.catalog._
+import org.apache.spark.sql.execution.command.DDLUtils
+import org.apache.spark.sql.types.StructType
 
 /**
  * Test suite for the [[HiveExternalCatalog]].
@@ -37,10 +40,27 @@ class HiveExternalCatalogSuite extends ExternalCatalogSuite {
     override val tableInputFormat: String = "org.apache.hadoop.mapred.SequenceFileInputFormat"
     override val tableOutputFormat: String = "org.apache.hadoop.mapred.SequenceFileOutputFormat"
     override def newEmptyCatalog(): ExternalCatalog = externalCatalog
+    override val defaultProvider: String = "hive"
   }
 
   protected override def resetState(): Unit = {
     externalCatalog.client.reset()
   }
 
+  import utils._
+
+  test("SPARK-18647: do not put provider in table properties for Hive serde table") {
+    val catalog = newBasicCatalog()
+    val hiveTable = CatalogTable(
+      identifier = TableIdentifier("hive_tbl", Some("db1")),
+      tableType = CatalogTableType.MANAGED,
+      storage = storageFormat,
+      schema = new StructType().add("col1", "int").add("col2", "string"),
+      provider = Some("hive"))
+    catalog.createTable(hiveTable, ignoreIfExists = false)
+
+    val rawTable = externalCatalog.client.getTable("db1", "hive_tbl")
+    assert(!rawTable.properties.contains(HiveExternalCatalog.DATASOURCE_PROVIDER))
+    assert(DDLUtils.isHiveTable(externalCatalog.getTable("db1", "hive_tbl")))
+  }
 }

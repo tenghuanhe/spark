@@ -21,8 +21,10 @@ import java.io._
 import java.nio.charset.StandardCharsets
 
 import scala.collection.mutable.ArrayBuffer
+import scala.io.Source
 
 import com.google.common.io.ByteStreams
+import org.apache.hadoop.fs.Path
 import org.scalatest.{BeforeAndAfterEach, Matchers}
 import org.scalatest.concurrent.Timeouts
 import org.scalatest.time.SpanSugar._
@@ -34,21 +36,12 @@ import org.apache.spark.deploy.SparkSubmitUtils.MavenCoordinate
 import org.apache.spark.internal.config._
 import org.apache.spark.internal.Logging
 import org.apache.spark.TestUtils.JavaSourceFromString
-import org.apache.spark.util.{ResetSystemProperties, Utils}
+import org.apache.spark.scheduler.EventLoggingListener
+import org.apache.spark.util.{CommandLineUtils, ResetSystemProperties, Utils}
 
-// Note: this suite mixes in ResetSystemProperties because SparkSubmit.main() sets a bunch
-// of properties that needed to be cleared after tests.
-class SparkSubmitSuite
-  extends SparkFunSuite
-  with Matchers
-  with BeforeAndAfterEach
-  with ResetSystemProperties
-  with Timeouts {
 
-  override def beforeEach() {
-    super.beforeEach()
-    System.setProperty("spark.testing", "true")
-  }
+trait TestPrematureExit {
+  suite: SparkFunSuite =>
 
   private val noOpOutputStream = new OutputStream {
     def write(b: Int) = {}
@@ -65,16 +58,19 @@ class SparkSubmitSuite
   }
 
   /** Returns true if the script exits and the given search string is printed. */
-  private def testPrematureExit(input: Array[String], searchString: String) = {
+  private[spark] def testPrematureExit(
+      input: Array[String],
+      searchString: String,
+      mainObject: CommandLineUtils = SparkSubmit) : Unit = {
     val printStream = new BufferPrintStream()
-    SparkSubmit.printStream = printStream
+    mainObject.printStream = printStream
 
     @volatile var exitedCleanly = false
-    SparkSubmit.exitFn = (_) => exitedCleanly = true
+    mainObject.exitFn = (_) => exitedCleanly = true
 
     val thread = new Thread {
       override def run() = try {
-        SparkSubmit.main(input)
+        mainObject.main(input)
       } catch {
         // If exceptions occur after the "exit" has happened, fine to ignore them.
         // These represent code paths not reachable during normal execution.
@@ -88,10 +84,26 @@ class SparkSubmitSuite
       fail(s"Search string '$searchString' not found in $joined")
     }
   }
+}
+
+// Note: this suite mixes in ResetSystemProperties because SparkSubmit.main() sets a bunch
+// of properties that needed to be cleared after tests.
+class SparkSubmitSuite
+  extends SparkFunSuite
+  with Matchers
+  with BeforeAndAfterEach
+  with ResetSystemProperties
+  with Timeouts
+  with TestPrematureExit {
+
+  override def beforeEach() {
+    super.beforeEach()
+    System.setProperty("spark.testing", "true")
+  }
 
   // scalastyle:off println
   test("prints usage on empty input") {
-    testPrematureExit(Array[String](), "Usage: spark-submit")
+    testPrematureExit(Array.empty[String], "Usage: spark-submit")
   }
 
   test("prints usage with only --help") {
@@ -137,6 +149,17 @@ class SparkSubmitSuite
       "--weird", "args")
     val appArgs = new SparkSubmitArguments(clArgs)
     appArgs.childArgs should be (Seq("--master", "local", "some", "--weird", "args"))
+  }
+
+  test("print the right queue name") {
+    val clArgs = Seq(
+      "--name", "myApp",
+      "--class", "Foo",
+      "--conf", "spark.yarn.queue=thequeue",
+      "userjar.jar")
+    val appArgs = new SparkSubmitArguments(clArgs)
+    appArgs.queue should be ("thequeue")
+    appArgs.toString should include ("thequeue")
   }
 
   test("specify deploy mode through configuration") {
@@ -204,7 +227,12 @@ class SparkSubmitSuite
     childArgsStr should include ("--arg arg1 --arg arg2")
     childArgsStr should include regex ("--jar .*thejar.jar")
     mainClass should be ("org.apache.spark.deploy.yarn.Client")
-    classpath should have length (0)
+
+    // In yarn cluster mode, also adding jars to classpath
+    classpath(0) should endWith ("thejar.jar")
+    classpath(1) should endWith ("one.jar")
+    classpath(2) should endWith ("two.jar")
+    classpath(3) should endWith ("three.jar")
 
     sysProps("spark.executor.memory") should be ("5g")
     sysProps("spark.driver.memory") should be ("4g")
@@ -379,6 +407,37 @@ class SparkSubmitSuite
     runSparkSubmit(args)
   }
 
+  test("launch simple application with spark-submit with redaction") {
+    val testDir = Utils.createTempDir()
+    testDir.deleteOnExit()
+    val testDirPath = new Path(testDir.getAbsolutePath())
+    val unusedJar = TestUtils.createJarWithClasses(Seq.empty)
+    val fileSystem = Utils.getHadoopFileSystem("/",
+      SparkHadoopUtil.get.newConfiguration(new SparkConf()))
+    try {
+      val args = Seq(
+        "--class", SimpleApplicationTest.getClass.getName.stripSuffix("$"),
+        "--name", "testApp",
+        "--master", "local",
+        "--conf", "spark.ui.enabled=false",
+        "--conf", "spark.master.rest.enabled=false",
+        "--conf", "spark.executorEnv.HADOOP_CREDSTORE_PASSWORD=secret_password",
+        "--conf", "spark.eventLog.enabled=true",
+        "--conf", "spark.eventLog.testing=true",
+        "--conf", s"spark.eventLog.dir=${testDirPath.toUri.toString}",
+        "--conf", "spark.hadoop.fs.defaultFS=unsupported://example.com",
+        unusedJar.toString)
+      runSparkSubmit(args)
+      val listStatus = fileSystem.listStatus(testDirPath)
+      val logData = EventLoggingListener.openEventLog(listStatus.last.getPath, fileSystem)
+      Source.fromInputStream(logData).getLines().foreach { line =>
+        assert(!line.contains("secret_password"))
+      }
+    } finally {
+      Utils.deleteRecursively(testDir)
+    }
+  }
+
   test("includes jars passed in through --jars") {
     val unusedJar = TestUtils.createJarWithClasses(Seq.empty)
     val jar1 = TestUtils.createJarWithClasses(Seq("SparkSubmitClassA"))
@@ -452,7 +511,7 @@ class SparkSubmitSuite
     val tempDir = Utils.createTempDir()
     val srcDir = new File(tempDir, "sparkrtest")
     srcDir.mkdirs()
-    val excSource = new JavaSourceFromString(new File(srcDir, "DummyClass").getAbsolutePath,
+    val excSource = new JavaSourceFromString(new File(srcDir, "DummyClass").toURI.getPath,
       """package sparkrtest;
         |
         |public class DummyClass implements java.io.Serializable {

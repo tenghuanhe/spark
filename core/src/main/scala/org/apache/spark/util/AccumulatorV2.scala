@@ -59,8 +59,9 @@ abstract class AccumulatorV2[IN, OUT] extends Serializable {
   }
 
   /**
-   * Returns true if this accumulator has been registered.  Note that all accumulators must be
-   * registered before use, or it will throw exception.
+   * Returns true if this accumulator has been registered.
+   *
+   * @note All accumulators must be registered before use, or it will throw exception.
    */
   final def isRegistered: Boolean =
     metadata != null && AccumulatorContext.get(metadata.id).isDefined
@@ -83,8 +84,12 @@ abstract class AccumulatorV2[IN, OUT] extends Serializable {
    * Returns the name of this accumulator, can only be called after registration.
    */
   final def name: Option[String] = {
-    assertMetadataNotNull()
-    metadata.name
+    if (atDriverSide) {
+      AccumulatorContext.get(id).flatMap(_.metadata.name)
+    } else {
+      assertMetadataNotNull()
+      metadata.name
+    }
   }
 
   /**
@@ -160,7 +165,15 @@ abstract class AccumulatorV2[IN, OUT] extends Serializable {
       }
       val copyAcc = copyAndReset()
       assert(copyAcc.isZero, "copyAndReset must return a zero value copy")
-      copyAcc.metadata = metadata
+      val isInternalAcc =
+        (name.isDefined && name.get.startsWith(InternalAccumulator.METRICS_PREFIX)) ||
+          getClass.getSimpleName == "SQLMetric"
+      if (isInternalAcc) {
+        // Do not serialize the name of internal accumulator and send it to executor.
+        copyAcc.metadata = metadata.copy(name = None)
+      } else {
+        copyAcc.metadata = metadata
+      }
       copyAcc
     } else {
       this
@@ -223,7 +236,7 @@ private[spark] object AccumulatorContext {
    * Registers an [[AccumulatorV2]] created on the driver such that it can be used on the executors.
    *
    * All accumulators registered here can later be used as a container for accumulating partial
-   * values across multiple tasks. This is what [[org.apache.spark.scheduler.DAGScheduler]] does.
+   * values across multiple tasks. This is what `org.apache.spark.scheduler.DAGScheduler` does.
    * Note: if an accumulator is registered here, it should also be registered with the active
    * context cleaner for cleanup so as to avoid memory leaks.
    *
@@ -262,23 +275,13 @@ private[spark] object AccumulatorContext {
     originals.clear()
   }
 
-  /**
-   * Looks for a registered accumulator by accumulator name.
-   */
-  private[spark] def lookForAccumulatorByName(name: String): Option[AccumulatorV2[_, _]] = {
-    originals.values().asScala.find { ref =>
-      val acc = ref.get
-      acc != null && acc.name.isDefined && acc.name.get == name
-    }.map(_.get)
-  }
-
   // Identifier for distinguishing SQL metrics from other accumulators
   private[spark] val SQL_ACCUM_IDENTIFIER = "sql"
 }
 
 
 /**
- * An [[AccumulatorV2 accumulator]] for computing sum, count, and averages for 64-bit integers.
+ * An [[AccumulatorV2 accumulator]] for computing sum, count, and average of 64-bit integers.
  *
  * @since 2.0.0
  */
@@ -444,7 +447,9 @@ class CollectionAccumulator[T] extends AccumulatorV2[T, java.util.List[T]] {
 
   override def copy(): CollectionAccumulator[T] = {
     val newAcc = new CollectionAccumulator[T]
-    newAcc._list.addAll(_list)
+    _list.synchronized {
+      newAcc._list.addAll(_list)
+    }
     newAcc
   }
 

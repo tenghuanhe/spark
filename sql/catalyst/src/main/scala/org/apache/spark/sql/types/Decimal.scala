@@ -20,7 +20,8 @@ package org.apache.spark.sql.types
 import java.lang.{Long => JLong}
 import java.math.{BigInteger, MathContext, RoundingMode}
 
-import org.apache.spark.annotation.DeveloperApi
+import org.apache.spark.annotation.InterfaceStability
+import org.apache.spark.sql.AnalysisException
 
 /**
  * A mutable implementation of BigDecimal that can hold a Long if values are small enough.
@@ -30,6 +31,7 @@ import org.apache.spark.annotation.DeveloperApi
  * - If decimalVal is set, it represents the whole decimal value
  * - Otherwise, the decimal value is longVal / (10 ** _scale)
  */
+@InterfaceStability.Unstable
 final class Decimal extends Ordered[Decimal] with Serializable {
   import org.apache.spark.sql.types.Decimal._
 
@@ -130,18 +132,22 @@ final class Decimal extends Ordered[Decimal] with Serializable {
   }
 
   /**
-   * Set this Decimal to the given BigInteger value. Will have precision 38 and scale 0.
+   * If the value is not in the range of long, convert it to BigDecimal and
+   * the precision and scale are based on the converted value.
+   *
+   * This code avoids BigDecimal object allocation as possible to improve runtime efficiency
    */
   def set(bigintval: BigInteger): Decimal = {
-    // TODO: Remove this once we migrate to java8 and use longValueExact() instead.
-    require(
-      bigintval.compareTo(LONG_MAX_BIG_INT) <= 0 && bigintval.compareTo(LONG_MIN_BIG_INT) >= 0,
-      s"BigInteger $bigintval too large for decimal")
-    this.decimalVal = null
-    this.longVal = bigintval.longValue()
-    this._precision = DecimalType.MAX_PRECISION
-    this._scale = 0
-    this
+    try {
+      this.decimalVal = null
+      this.longVal = bigintval.longValueExact()
+      this._precision = DecimalType.MAX_PRECISION
+      this._scale = 0
+      this
+    } catch {
+      case _: ArithmeticException =>
+        set(BigDecimal(bigintval))
+    }
   }
 
   /**
@@ -177,7 +183,7 @@ final class Decimal extends Ordered[Decimal] with Serializable {
 
   def toUnscaledLong: Long = {
     if (decimalVal.ne(null)) {
-      decimalVal.underlying().unscaledValue().longValue()
+      decimalVal.underlying().unscaledValue().longValueExact()
     } else {
       longVal
     }
@@ -185,7 +191,6 @@ final class Decimal extends Ordered[Decimal] with Serializable {
 
   override def toString: String = toBigDecimal.toString()
 
-  @DeveloperApi
   def toDebugString: String = {
     if (decimalVal.ne(null)) {
       s"Decimal(expanded,$decimalVal,$precision,$scale})"
@@ -224,6 +229,19 @@ final class Decimal extends Ordered[Decimal] with Serializable {
   def changePrecision(precision: Int, scale: Int, mode: Int): Boolean = mode match {
     case java.math.BigDecimal.ROUND_HALF_UP => changePrecision(precision, scale, ROUND_HALF_UP)
     case java.math.BigDecimal.ROUND_HALF_EVEN => changePrecision(precision, scale, ROUND_HALF_EVEN)
+  }
+
+  /**
+   * Create new `Decimal` with given precision and scale.
+   *
+   * @return `Some(decimal)` if successful or `None` if overflow would occur
+   */
+  private[sql] def toPrecision(
+      precision: Int,
+      scale: Int,
+      roundMode: BigDecimal.RoundingMode.Value = ROUND_HALF_UP): Option[Decimal] = {
+    val copy = clone()
+    if (copy.changePrecision(precision, scale, roundMode)) Some(copy) else None
   }
 
   /**
@@ -366,20 +384,19 @@ final class Decimal extends Ordered[Decimal] with Serializable {
   def abs: Decimal = if (this.compare(Decimal.ZERO) < 0) this.unary_- else this
 
   def floor: Decimal = if (scale == 0) this else {
-    val value = this.clone()
-    value.changePrecision(
-      DecimalType.bounded(precision - scale + 1, 0).precision, 0, ROUND_FLOOR)
-    value
+    val newPrecision = DecimalType.bounded(precision - scale + 1, 0).precision
+    toPrecision(newPrecision, 0, ROUND_FLOOR).getOrElse(
+      throw new AnalysisException(s"Overflow when setting precision to $newPrecision"))
   }
 
   def ceil: Decimal = if (scale == 0) this else {
-    val value = this.clone()
-    value.changePrecision(
-      DecimalType.bounded(precision - scale + 1, 0).precision, 0, ROUND_CEILING)
-    value
+    val newPrecision = DecimalType.bounded(precision - scale + 1, 0).precision
+    toPrecision(newPrecision, 0, ROUND_CEILING).getOrElse(
+      throw new AnalysisException(s"Overflow when setting precision to $newPrecision"))
   }
 }
 
+@InterfaceStability.Unstable
 object Decimal {
   val ROUND_HALF_UP = BigDecimal.RoundingMode.HALF_UP
   val ROUND_HALF_EVEN = BigDecimal.RoundingMode.HALF_EVEN

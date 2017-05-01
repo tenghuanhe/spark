@@ -56,6 +56,10 @@ singleTableIdentifier
     : tableIdentifier EOF
     ;
 
+singleFunctionIdentifier
+    : functionIdentifier EOF
+    ;
+
 singleDataType
     : dataType EOF
     ;
@@ -69,30 +73,32 @@ statement
     | ALTER DATABASE identifier SET DBPROPERTIES tablePropertyList     #setDatabaseProperties
     | DROP DATABASE (IF EXISTS)? identifier (RESTRICT | CASCADE)?      #dropDatabase
     | createTableHeader ('(' colTypeList ')')? tableProvider
-        (OPTIONS tablePropertyList)?
+        (OPTIONS options=tablePropertyList)?
         (PARTITIONED BY partitionColumnNames=identifierList)?
-        bucketSpec?                                                    #createTableUsing
-    | createTableHeader tableProvider
-        (OPTIONS tablePropertyList)?
-        (PARTITIONED BY partitionColumnNames=identifierList)?
-        bucketSpec? AS? query                                          #createTableUsing
+        bucketSpec? locationSpec?
+        (COMMENT comment=STRING)?
+        (AS? query)?                                                   #createTable
     | createTableHeader ('(' columns=colTypeList ')')?
-        (COMMENT STRING)?
+        (COMMENT comment=STRING)?
         (PARTITIONED BY '(' partitionColumns=colTypeList ')')?
         bucketSpec? skewSpec?
         rowFormat?  createFileFormat? locationSpec?
         (TBLPROPERTIES tablePropertyList)?
-        (AS? query)?                                                   #createTable
+        (AS? query)?                                                   #createHiveTable
     | CREATE TABLE (IF NOT EXISTS)? target=tableIdentifier
-        LIKE source=tableIdentifier                                    #createTableLike
+        LIKE source=tableIdentifier locationSpec?                      #createTableLike
     | ANALYZE TABLE tableIdentifier partitionSpec? COMPUTE STATISTICS
-        (identifier | FOR COLUMNS identifierSeq?)?                     #analyze
+        (identifier | FOR COLUMNS identifierSeq)?                      #analyze
+    | ALTER TABLE tableIdentifier
+        ADD COLUMNS '(' columns=colTypeList ')'                        #addTableColumns
     | ALTER (TABLE | VIEW) from=tableIdentifier
         RENAME TO to=tableIdentifier                                   #renameTable
     | ALTER (TABLE | VIEW) tableIdentifier
         SET TBLPROPERTIES tablePropertyList                            #setTableProperties
     | ALTER (TABLE | VIEW) tableIdentifier
         UNSET TBLPROPERTIES (IF EXISTS)? tablePropertyList             #unsetTableProperties
+    | ALTER TABLE tableIdentifier partitionSpec?
+        CHANGE COLUMN? identifier colType colPosition?                 #changeColumn
     | ALTER TABLE tableIdentifier (partitionSpec)?
         SET SERDE STRING (WITH SERDEPROPERTIES tablePropertyList)?     #setTableSerDe
     | ALTER TABLE tableIdentifier (partitionSpec)?
@@ -111,20 +117,24 @@ statement
     | ALTER TABLE tableIdentifier RECOVER PARTITIONS                   #recoverPartitions
     | DROP TABLE (IF EXISTS)? tableIdentifier PURGE?                   #dropTable
     | DROP VIEW (IF EXISTS)? tableIdentifier                           #dropTable
-    | CREATE (OR REPLACE)? TEMPORARY? VIEW (IF NOT EXISTS)? tableIdentifier
+    | CREATE (OR REPLACE)? (GLOBAL? TEMPORARY)?
+        VIEW (IF NOT EXISTS)? tableIdentifier
         identifierCommentList? (COMMENT STRING)?
         (PARTITIONED ON identifierList)?
         (TBLPROPERTIES tablePropertyList)? AS query                    #createView
-    | CREATE (OR REPLACE)? TEMPORARY VIEW
+    | CREATE (OR REPLACE)? GLOBAL? TEMPORARY VIEW
         tableIdentifier ('(' colTypeList ')')? tableProvider
         (OPTIONS tablePropertyList)?                                   #createTempViewUsing
     | ALTER VIEW tableIdentifier AS? query                             #alterViewQuery
     | CREATE TEMPORARY? FUNCTION qualifiedName AS className=STRING
         (USING resource (',' resource)*)?                              #createFunction
     | DROP TEMPORARY? FUNCTION (IF EXISTS)? qualifiedName              #dropFunction
-    | EXPLAIN (LOGICAL | FORMATTED | EXTENDED | CODEGEN)? statement    #explain
+    | EXPLAIN (LOGICAL | FORMATTED | EXTENDED | CODEGEN | COST)?
+        statement                                                      #explain
     | SHOW TABLES ((FROM | IN) db=identifier)?
         (LIKE? pattern=STRING)?                                        #showTables
+    | SHOW TABLE EXTENDED ((FROM | IN) db=identifier)?
+        LIKE pattern=STRING partitionSpec?                             #showTable
     | SHOW DATABASES (LIKE pattern=STRING)?                            #showDatabases
     | SHOW TBLPROPERTIES table=tableIdentifier
         ('(' key=tablePropertyKey ')')?                                #showTblProperties
@@ -136,12 +146,12 @@ statement
     | SHOW CREATE TABLE tableIdentifier                                #showCreateTable
     | (DESC | DESCRIBE) FUNCTION EXTENDED? describeFuncName            #describeFunction
     | (DESC | DESCRIBE) DATABASE EXTENDED? identifier                  #describeDatabase
-    | (DESC | DESCRIBE) option=(EXTENDED | FORMATTED)?
+    | (DESC | DESCRIBE) TABLE? option=(EXTENDED | FORMATTED)?
         tableIdentifier partitionSpec? describeColName?                #describeTable
     | REFRESH TABLE tableIdentifier                                    #refreshTable
     | REFRESH .*?                                                      #refreshResource
     | CACHE LAZY? TABLE tableIdentifier (AS? query)?                   #cacheTable
-    | UNCACHE TABLE tableIdentifier                                    #uncacheTable
+    | UNCACHE TABLE (IF EXISTS)? tableIdentifier                       #uncacheTable
     | CLEAR CACHE                                                      #clearCache
     | LOAD DATA LOCAL? INPATH path=STRING OVERWRITE? INTO TABLE
         tableIdentifier partitionSpec?                                 #loadData
@@ -194,8 +204,6 @@ unsupportedHiveNativeCommands
     | kw1=ALTER kw2=TABLE tableIdentifier partitionSpec? kw3=COMPACT
     | kw1=ALTER kw2=TABLE tableIdentifier partitionSpec? kw3=CONCATENATE
     | kw1=ALTER kw2=TABLE tableIdentifier partitionSpec? kw3=SET kw4=FILEFORMAT
-    | kw1=ALTER kw2=TABLE tableIdentifier partitionSpec? kw3=ADD kw4=COLUMNS
-    | kw1=ALTER kw2=TABLE tableIdentifier partitionSpec? kw3=CHANGE kw4=COLUMN?
     | kw1=ALTER kw2=TABLE tableIdentifier partitionSpec? kw3=REPLACE kw4=COLUMNS
     | kw1=START kw2=TRANSACTION
     | kw1=COMMIT
@@ -363,13 +371,22 @@ querySpecification
        (RECORDREADER recordReader=STRING)?
        fromClause?
        (WHERE where=booleanExpression)?)
-    | ((kind=SELECT setQuantifier? namedExpressionSeq fromClause?
+    | ((kind=SELECT hint? setQuantifier? namedExpressionSeq fromClause?
        | fromClause (kind=SELECT setQuantifier? namedExpressionSeq)?)
        lateralView*
        (WHERE where=booleanExpression)?
        aggregation?
        (HAVING having=booleanExpression)?
        windows?)
+    ;
+
+hint
+    : '/*+' hintStatement '*/'
+    ;
+
+hintStatement
+    : hintName=identifier
+    | hintName=identifier '(' parameters+=identifier (',' parameters+=identifier)* ')'
     ;
 
 fromClause
@@ -480,6 +497,10 @@ tableIdentifier
     : (db=identifier '.')? table=identifier
     ;
 
+functionIdentifier
+    : (db=identifier '.')? function=identifier
+    ;
+
 namedExpression
     : expression (AS? (identifier | identifierList))?
     ;
@@ -494,10 +515,10 @@ expression
 
 booleanExpression
     : NOT booleanExpression                                        #logicalNot
+    | EXISTS '(' query ')'                                         #exists
     | predicated                                                   #booleanDefault
     | left=booleanExpression operator=AND right=booleanExpression  #logicalBinary
     | left=booleanExpression operator=OR right=booleanExpression   #logicalBinary
-    | EXISTS '(' query ')'                                         #exists
     ;
 
 // workaround for:
@@ -527,16 +548,19 @@ valueExpression
     ;
 
 primaryExpression
-    : constant                                                                                 #constantDefault
-    | name=(CURRENT_DATE | CURRENT_TIMESTAMP)                                                  #timeFunctionCall
+    : name=(CURRENT_DATE | CURRENT_TIMESTAMP)                                                  #timeFunctionCall
+    | CASE whenClause+ (ELSE elseExpression=expression)? END                                   #searchedCase
+    | CASE value=expression whenClause+ (ELSE elseExpression=expression)? END                  #simpleCase
+    | CAST '(' expression AS dataType ')'                                                      #cast
+    | FIRST '(' expression (IGNORE NULLS)? ')'                                                 #first
+    | LAST '(' expression (IGNORE NULLS)? ')'                                                  #last
+    | constant                                                                                 #constantDefault
     | ASTERISK                                                                                 #star
     | qualifiedName '.' ASTERISK                                                               #star
-    | '(' expression (',' expression)+ ')'                                                     #rowConstructor
-    | qualifiedName '(' (setQuantifier? expression (',' expression)*)? ')' (OVER windowSpec)?  #functionCall
+    | '(' namedExpression (',' namedExpression)+ ')'                                           #rowConstructor
     | '(' query ')'                                                                            #subqueryExpression
-    | CASE valueExpression whenClause+ (ELSE elseExpression=expression)? END                   #simpleCase
-    | CASE whenClause+ (ELSE elseExpression=expression)? END                                   #searchedCase
-    | CAST '(' expression AS dataType ')'                                                      #cast
+    | qualifiedName '(' (setQuantifier? namedExpression (',' namedExpression)*)? ')'
+       (OVER windowSpec)?                                                                      #functionCall
     | value=primaryExpression '[' index=valueExpression ']'                                    #subscript
     | identifier                                                                               #columnReference
     | base=primaryExpression '.' fieldName=identifier                                          #dereference
@@ -581,10 +605,14 @@ intervalValue
     | STRING
     ;
 
+colPosition
+    : FIRST | AFTER identifier
+    ;
+
 dataType
     : complex=ARRAY '<' dataType '>'                            #complexDataType
     | complex=MAP '<' dataType ',' dataType '>'                 #complexDataType
-    | complex=STRUCT ('<' colTypeList? '>' | NEQ)               #complexDataType
+    | complex=STRUCT ('<' complexColTypeList? '>' | NEQ)        #complexDataType
     | identifier ('(' INTEGER_VALUE (',' INTEGER_VALUE)* ')')?  #primitiveDataType
     ;
 
@@ -593,7 +621,15 @@ colTypeList
     ;
 
 colType
-    : identifier ':'? dataType (COMMENT STRING)?
+    : identifier dataType (COMMENT STRING)?
+    ;
+
+complexColTypeList
+    : complexColType (',' complexColType)*
+    ;
+
+complexColType
+    : identifier ':' dataType (COMMENT STRING)?
     ;
 
 whenClause
@@ -653,7 +689,6 @@ quotedIdentifier
 
 number
     : MINUS? DECIMAL_VALUE            #decimalLiteral
-    | MINUS? SCIENTIFIC_DECIMAL_VALUE #scientificDecimalLiteral
     | MINUS? INTEGER_VALUE            #integerLiteral
     | MINUS? BIGINT_LITERAL           #bigIntLiteral
     | MINUS? SMALLINT_LITERAL         #smallIntLiteral
@@ -665,19 +700,19 @@ number
 nonReserved
     : SHOW | TABLES | COLUMNS | COLUMN | PARTITIONS | FUNCTIONS | DATABASES
     | ADD
-    | OVER | PARTITION | RANGE | ROWS | PRECEDING | FOLLOWING | CURRENT | ROW | LAST | FIRST
+    | OVER | PARTITION | RANGE | ROWS | PRECEDING | FOLLOWING | CURRENT | ROW | LAST | FIRST | AFTER
     | MAP | ARRAY | STRUCT
     | LATERAL | WINDOW | REDUCE | TRANSFORM | USING | SERDE | SERDEPROPERTIES | RECORDREADER
     | DELIMITED | FIELDS | TERMINATED | COLLECTION | ITEMS | KEYS | ESCAPED | LINES | SEPARATED
-    | EXTENDED | REFRESH | CLEAR | CACHE | UNCACHE | LAZY | TEMPORARY | OPTIONS
+    | EXTENDED | REFRESH | CLEAR | CACHE | UNCACHE | LAZY | GLOBAL | TEMPORARY | OPTIONS
     | GROUPING | CUBE | ROLLUP
-    | EXPLAIN | FORMAT | LOGICAL | FORMATTED | CODEGEN
+    | EXPLAIN | FORMAT | LOGICAL | FORMATTED | CODEGEN | COST
     | TABLESAMPLE | USE | TO | BUCKET | PERCENTLIT | OUT | OF
     | SET | RESET
     | VIEW | REPLACE
     | IF
     | NO | DATA
-    | START | TRANSACTION | COMMIT | ROLLBACK
+    | START | TRANSACTION | COMMIT | ROLLBACK | IGNORE
     | SORT | CLUSTER | DISTRIBUTE | UNSET | TBLPROPERTIES | SKEWED | STORED | DIRECTORIES | LOCATION
     | EXCHANGE | ARCHIVE | UNARCHIVE | FILEFORMAT | TOUCH | COMPACT | CONCATENATE | CHANGE
     | CASCADE | RESTRICT | BUCKETS | CLUSTERED | SORTED | PURGE | INPUTFORMAT | OUTPUTFORMAT
@@ -755,6 +790,7 @@ PRECEDING: 'PRECEDING';
 FOLLOWING: 'FOLLOWING';
 CURRENT: 'CURRENT';
 FIRST: 'FIRST';
+AFTER: 'AFTER';
 LAST: 'LAST';
 ROW: 'ROW';
 WITH: 'WITH';
@@ -771,6 +807,7 @@ EXPLAIN: 'EXPLAIN';
 FORMAT: 'FORMAT';
 LOGICAL: 'LOGICAL';
 CODEGEN: 'CODEGEN';
+COST: 'COST';
 CAST: 'CAST';
 SHOW: 'SHOW';
 TABLES: 'TABLES';
@@ -801,6 +838,7 @@ TRANSACTION: 'TRANSACTION';
 COMMIT: 'COMMIT';
 ROLLBACK: 'ROLLBACK';
 MACRO: 'MACRO';
+IGNORE: 'IGNORE';
 
 IF: 'IF';
 
@@ -857,6 +895,7 @@ CACHE: 'CACHE';
 UNCACHE: 'UNCACHE';
 LAZY: 'LAZY';
 FORMATTED: 'FORMATTED';
+GLOBAL: 'GLOBAL';
 TEMPORARY: 'TEMPORARY' | 'TEMP';
 OPTIONS: 'OPTIONS';
 UNSET: 'UNSET';
@@ -944,12 +983,8 @@ INTEGER_VALUE
     ;
 
 DECIMAL_VALUE
-    : DECIMAL_DIGITS {isValidDecimal()}?
-    ;
-
-SCIENTIFIC_DECIMAL_VALUE
     : DIGIT+ EXPONENT
-    | DECIMAL_DIGITS EXPONENT {isValidDecimal()}?
+    | DECIMAL_DIGITS EXPONENT? {isValidDecimal()}?
     ;
 
 DOUBLE_LITERAL
@@ -991,8 +1026,12 @@ SIMPLE_COMMENT
     : '--' ~[\r\n]* '\r'? '\n'? -> channel(HIDDEN)
     ;
 
+BRACKETED_EMPTY_COMMENT
+    : '/**/' -> channel(HIDDEN)
+    ;
+
 BRACKETED_COMMENT
-    : '/*' .*? '*/' -> channel(HIDDEN)
+    : '/*' ~[+] .*? '*/' -> channel(HIDDEN)
     ;
 
 WS
